@@ -63,27 +63,35 @@ Ownership changes use the dedicated endpoint rather than a general organisation 
 - Support a user account being associated with memberships in multiple organisations.
 - Restrict API access to the authorised client application.
 
-Account lifecycle details, identity linking and unlinking policy, and the mapping of provider changes and deletions remain to be defined. Email addresses must not be assumed to uniquely identify or automatically link accounts without an explicit policy.
+API calls and verified provider webhooks are authoritative for account provisioning and lifecycle changes; Precinct imposes no additional provisioning policy. API updates remain subject to the timestamp rule below. Email addresses must not be assumed to uniquely identify or automatically link accounts without an explicit policy.
+
+## Deletion lifecycle
+
+Deletion requests flag the affected record for deletion and suspend it; a later sweep permanently erases it. This applies to deletions initiated through the API or a provider webhook. A deletion flag may be removed before the sweep, but the record remains suspended until separately unsuspended. Organisation sweeps also erase all organisation child data. Sweep scheduling and the effects of suspension remain to be defined.
+
+## Update timestamps
+
+Every API update request must include a timestamp. Precinct checks it against the latest timestamp recorded for the target record and ignores updates with a timestamp equal to or older than the latest recorded timestamp. Successfully applied updates record their timestamp, making repeated updates idempotent. Timestamp format and precision, and the response to an ignored update, remain to be defined.
 
 ## Authentication provider webhooks
 
-The first release supports Clerk as its authentication provider. Precinct exposes a webhook endpoint for Clerk to send account events; the integration should permit additional providers in future. It must verify each incoming webhook using the provider's configured verification mechanism before processing it. Updates from both API requests and webhooks use timestamps to make processing idempotent and prevent an older update from overwriting a newer one. Repeating the same update must not change the resulting state, and event handling must not assume events always arrive in order. Invalid or unverifiable events must not change account data.
+The first release supports Clerk as its authentication provider. Precinct exposes a webhook endpoint for Clerk to send account events; the integration should permit additional providers in future. It must verify each incoming webhook using the provider's configured verification mechanism before processing it. Verified webhook events apply regardless of the record’s timestamp; the API timestamp comparison does not suppress them. Record the event timestamp as the record’s latest timestamp when supplied, or use the server time at receipt if it is absent. Duplicate deliveries must be handled idempotently. Events may arrive out of order, and their delivery order can affect the resulting state. Invalid or unverifiable events must not change account data.
 
-The first release handles Clerk `user.created`, `user.updated`, and `user.deleted` events to create, update, and delete accounts. The Clerk user ID is stored as the external identity and is distinct from the Precinct UUID. Map the user's non-blank first and last names, joined with a space, to `name`; if neither is present, use the username, then the Clerk user ID as a fallback. Map `display_name` to the username when present, otherwise to `name`. Map email to the address identified by Clerk's primary email address ID, or null if none is available. Preserve application-owned account metadata rather than overwriting it from Clerk. Apply the same mapping on creation and update, subject to timestamp ordering and field validation.
+The first release handles Clerk `user.created`, `user.updated`, and `user.deleted` events to create, update, and flag accounts for deletion and suspension. The Clerk user ID is stored as the external identity and is distinct from the Precinct UUID. Map the user's non-blank first and last names, joined with a space, to `name`; if neither is present, use the username, then the Clerk user ID as a fallback. Map `display_name` to the username when present, otherwise to `name`. Map email to the address identified by Clerk's primary email address ID, or null if none is available. Preserve application-owned account metadata rather than overwriting it from Clerk. Apply the same mapping on creation and update, subject to field validation.
 
-The timestamp source, precision and equal-timestamp handling, ordering and reconciliation strategy, and failure and retry responses remain to be defined. Webhook authentication is separate from the API key used by the associated application.
+The reconciliation strategy and failure and retry responses remain to be defined. Webhook authentication is separate from the API key used by the associated application.
 
 ## Authentication and authorisation
 
 Third-party providers authenticate human users for the product. Precinct does not provide a direct interface for those users or authenticate them for API access. The associated application authenticates its HTTP API requests with an API key that remains valid until revoked; authentication providers authenticate webhook deliveries using their configured verification mechanisms. The client application is the full authority for product-level decisions and end-user authorisation. Precinct imposes no product-level permission or operation constraints on it.
 
-The supported identity providers and webhook verification mechanisms, API key lifecycle, remain open decisions.
+Further provider integrations and webhook operational details remain open decisions.
 
 ## Audit logging
 
 Precinct records API key lifecycle actions, including creation, rotation, and revocation, and lifecycle events for domain entities in audit logs. Domain events include creation, updates, and deletion, as well as organisation ownership transfers, suspension and unsuspension, deletion flag changes, and deletion sweeps. Account changes originating from the API or provider webhooks are audited.
 
-Audit entries identify the event, its time, the affected entity or key identifier, and the source of the action where available. They must not contain API key secrets. Audit logs are split into files by date. Retention is configurable and defaults to 90 days. The level of detail recorded for changes remains to be defined.
+Each audit entry is a simple text statement that an event occurred, without recording change details. Entries must not contain API key secrets. Audit logs are split into files by date. Retention is configurable and defaults to 90 days.
 
 ## Expected outcomes
 
@@ -95,7 +103,3 @@ Audit entries identify the event, its time, the affected entity or key identifie
 
 ## Open product decisions
 
-- Which timestamps govern updates, and how are equal timestamps and deletion handled?
-- What are the detailed account provisioning and deletion rules?
-- How are external identities linked, unlinked, and recovered?
-- What audit change detail, privacy, and data export requirements apply?
