@@ -2,7 +2,7 @@
 
 ## Architectural goals
 
-Each Precinct instance supports a single product and provides organisation, membership, and common user account capabilities to its associated application through an API-key-secured HTTP API. The application performs CRUD operations on Precinct records through that API and exclusively controls organisations through it. Precinct also receives account events at a webhook endpoint for third-party authentication providers. It delegates authentication to third-party providers, with Clerk supported in the first release. The implementation uses C#, hexagonal architecture, PostgreSQL, and Docker Compose.
+Each Precinct instance supports a single product and provides organisation, membership, and mirrored user account capabilities to its associated application through an API-key-secured HTTP API. The application controls organisations and memberships and can read account mirrors and manage their application-owned metadata. Clerk owns user accounts and their profile data; Precinct receives account events at a webhook endpoint and delegates authentication to Clerk. The implementation uses C#, hexagonal architecture, PostgreSQL, and Docker Compose.
 
 The architecture should keep business rules independent of delivery mechanisms, identity providers, and persistence, while preserving the boundaries between tenant records and securing its integration endpoints. Human users do not access Precinct directly.
 
@@ -10,17 +10,22 @@ The architecture should keep business rules independent of delivery mechanisms, 
 
 ```mermaid
 flowchart LR
-    Client[Associated application] -->|HTTP requests and API key| API[Precinct]
-    Provider[Third-party authentication provider] -->|Account event webhooks| API
-    API --> DB[(PostgreSQL)]
+    Client[Associated application] -->|HTTP requests with API key| ClientAPI[Client API adapter]
+    Clerk[Clerk authentication provider] -->|Signed account event webhooks| Webhook[Clerk webhook adapter]
+    subgraph Precinct
+        ClientAPI --> Application[Application use cases]
+        Webhook -->|Verified events| Application
+        Application --> Persistence[PostgreSQL adapter]
+    end
+    Persistence --> DB[(PostgreSQL)]
 ```
 
-The diagram is logical: the exact authentication protocol, request flows, and deployment topology remain to be selected. Precinct owns its organisation, membership, account, and external identity associations; the provider owns authentication and its external identity.
+The diagram is logical; detailed request flows and deployment topology remain to be selected. Precinct owns organisation and membership records and stores a local mirror identified by the Clerk user ID. Clerk owns the account, profile data, and authentication; the client application owns Precinct account metadata.
 
 ## Hexagonal structure
 
 - **Domain:** Organisation, user account, membership, and external identity concepts and their invariants. Domain code has no dependency on PostgreSQL, HTTP, Docker, or a specific identity provider.
-- **Application:** Use cases coordinate domain operations, transaction boundaries, and ports. Inbound ports expose use cases; outbound ports express required persistence and other external capabilities.
+- **Application:** Use cases coordinate domain operations, queries, and transaction boundaries. Inbound ports expose use cases; outbound ports express required persistence and other external capabilities.
 - **Inbound adapters:** The service's delivery interface translates authenticated client requests into application use cases and maps outcomes to responses. A separate webhook endpoint receives provider account events and translates verified events into application use cases. The HTTP API style and contracts are not yet specified.
 - **Outbound adapters:** PostgreSQL persistence and any required external integrations implement application ports. Provider-specific webhook validation and configuration stay in the relevant adapter.
 - **Composition root:** The host configures dependency injection, adapters, settings, and service lifecycle.
@@ -29,45 +34,50 @@ Dependencies point inward: adapters depend on application ports and domain conce
 
 ## Data and consistency
 
-PostgreSQL is the system of record for Precinct-owned data. Precinct exposes stable UUID identifiers for its records through the client API. Organisations and user accounts have stable UUIDs assigned on creation. Organisations have a name, owner account, and optional description and metadata. Accounts have a name, display name, and optional email and metadata. Metadata is opaque JSON whose contents are owned, validated, and handled by the client application; Precinct checks that it is valid JSON but does not interpret roles or other metadata contents. Precinct validates required fields and references, including non-blank names and the format of optional email addresses, and enforces the field limits in the functional specification. Memberships associate accounts with organisations; external identities associate a provider and provider subject with an account. Persistence must enforce uniqueness for organisation/user membership and provider/subject identity pairs, including under concurrent requests. Foreign keys and transactions should preserve referential integrity and the invariants of each operation.
+PostgreSQL is the system of record for Precinct-owned data and stores the local Clerk account mirror. Precinct exposes stable UUID identifiers for its records through the client API. Organisations and account mirrors have stable UUIDs assigned on creation. Organisations have a name, owner account, and optional description and metadata. Account mirrors have a Clerk-owned name and optional email, plus application-owned metadata. Metadata is opaque JSON whose contents are owned, validated, and handled by the client application; Precinct checks that it is valid JSON but does not interpret roles or other metadata contents. Precinct validates required fields and references, including non-blank names and the format of optional email addresses, and enforces the field limits in the functional specification. Memberships associate account mirrors with organisations; each Clerk user ID identifies at most one mirror. Uniqueness, referential integrity, and the invariants of each operation must hold under concurrent requests.
 
-Ownership transfers use a dedicated API endpoint. Deletion through the API or a webhook flags and suspends the affected record; a later sweep permanently erases it. An organisation sweep also erases all organisation child data. Removing the deletion flag before the sweep leaves the organisation suspended; unsuspension is a separate operation. The sweep must preserve shared accounts and other records that are not children of the organisation, even when they are referenced by memberships. Organisation changes originate from client API requests, while authoritative account provisioning and lifecycle changes can originate from either API requests or verified provider webhooks, without additional provisioning policy; both paths must preserve the same domain invariants. Every API update must include a timestamp checked against the target record’s latest recorded timestamp. Successfully applied updates record that timestamp, and updates with equal or older timestamps are ignored. Verified webhook events apply regardless of the recorded timestamp. Record the event timestamp as the latest record timestamp, falling back to server time at receipt when absent; duplicate deliveries are handled idempotently. Out-of-order webhook delivery can affect the resulting state. The timestamp format and precision, sweep scheduling, durable processing and reconciliation strategy, schema, migration tooling, account deletion semantics, pagination, and concurrency strategy are to be specified during implementation. Provider subjects should be stored in a form that preserves their provider-defined identity semantics.
+### Persistence and concurrency
 
-The Clerk adapter handles `user.created`, `user.updated`, and `user.deleted` events and translates them into account lifecycle use cases using the field mapping in the functional specification. Clerk user IDs are external identifiers, not Precinct UUIDs, and webhook updates preserve application-owned metadata. Clerk webhooks are asynchronous and may be delayed or retried. Account synchronisation is therefore eventually consistent; synchronous client flows must not depend on immediate webhook delivery.
+PostgreSQL tables store the current state of organisations, account mirrors, memberships, and their Clerk identifiers. Use cases read and update those records through persistence ports. Database constraints and transactions enforce uniqueness, references, and operation invariants under concurrent requests. API updates use an expected record version, compared and advanced atomically; mismatches result in a conflict. Webhook changes advance the account mirror version as well. Define the schema, transaction boundaries, and operations subject to version checks before implementation.
+
+Queries read the stored records. Audit entries are stored separately in PostgreSQL; they are not the source of domain state.
+
+### Lifecycle and consistency
+
+The client controls organisations through the API, including ownership transfer through a dedicated endpoint. Clerk events create and maintain account mirrors; the client may update application-owned mirror metadata but cannot provision accounts, change Clerk profile fields, or delete accounts through Precinct. Invitations are out of scope.
+
+An API deletion request marks an organisation pending deletion. After a grace period, a sweep permanently erases it and its child data while preserving shared account mirrors. Organisation deletion may be cancelled before the sweep. A Clerk deletion event marks the corresponding account mirror pending deletion for a later sweep. The client application determines the product-level effects of pending deletion. Erasure must also cover backups and other retained copies according to a defined policy. The grace period, cancellation rules for account mirrors, and backup restoration procedure remain to be designed before implementation.
+
+Duplicate webhook deliveries are handled idempotently. Webhook ordering and reconciliation are separate from API version checks and remain to be defined.
+
+### Clerk integration
+
+The first release handles Clerk `user.created`, `user.updated`, and `user.deleted` events through a Clerk-specific inbound webhook adapter with a small application boundary. Deletion marks the account pending deletion for a later sweep. Clerk user IDs are external identifiers, distinct from Precinct UUIDs. The adapter uses the field mapping in the functional specification and preserves application-owned metadata. Clerk webhooks are asynchronous and may be delayed or retried, so synchronous client flows must not depend on immediate delivery.
 
 ## Security boundaries
 
 The HTTP inbound adapter validates the application API key before dispatching protected CRUD requests. The Clerk webhook adapter verifies event signatures using its configured signing secret and the provider’s prescribed verification mechanism; it does not rely on the application API key. Precinct does not authenticate human users for API access; the client application handles end-user authorisation in the product. Use cases and persistence queries must preserve the organisation scope of tenant records. The authenticated client application has full authority over product-level operations; Precinct does not impose product-level permissions or policy constraints. Data validation, referential integrity, and the specified lifecycle and security rules still apply.
 
-Secrets and provider configuration are supplied at deployment time, not committed to source control. Logs should avoid credentials and unnecessary personal data. Transport security, audit requirements, and production secret management must be defined for the deployment environment.
+Secrets and provider configuration are supplied at deployment time, not committed to source control. Logs should avoid credentials and unnecessary personal data. API requests require TLS as described below; TLS termination and production secret management must be defined for the deployment environment.
 
-## Proposed API key handling
+## API key handling
 
-Each instance maintains a small set of independently revocable keys for its associated application. Keys authenticate the application and have access to the client API; they do not represent human users. Provider webhooks use their own verification mechanism.
+Each instance accepts one deployment-configured API key for its associated application. The key authenticates the application and does not represent a human user. Provider webhooks use their own verification mechanism.
 
-- Generate each key with a cryptographically secure random generator using at least 256 bits of entropy. Give it a non-secret identifier and a format such as `precinct_<key-id>_<secret>`; the identifier selects the stored verifier.
-- Store only the identifier, a SHA-256 hash of the random secret, creation time and revocation status in PostgreSQL. Never store or log the plaintext key. Compare verifiers in constant time.
-- Create keys through an operator-only administrative command run against the instance, separate from the client API. Display the plaintext key once, at creation, and deliver it to the application through a deployment secret manager or another secure channel. Bootstrap and operator access are deployment responsibilities.
-- Send the key in an `Authorization: Bearer <key>` header over TLS. Reject missing, malformed, revoked, or invalid keys without exposing which verification step failed. Never put keys in URLs or logs.
-- Rotate by creating a second key, updating the application to use it, and revoking the old key after the transition. Revocation takes effect on subsequent requests. If a key is compromised, revoke it immediately and issue a replacement.
-- Record key lifecycle actions in audit logs without recording secrets. Protect administrative access, configuration, and database backups; rate-limit failed authentication attempts where practical.
-
-Keys do not expire; they remain valid until revoked. The administrative command interface and precise deployment secret mechanism remain to be defined.
+- Generate the key with a cryptographically secure random generator using at least 256 bits of entropy and provide it through deployment-managed secrets or another secure channel. Never commit or log the key.
+- Send the key in an `Authorization: Bearer <key>` header over TLS. Compare credentials in constant time and reject missing, malformed, or invalid keys without revealing verification details. Never put keys in URLs.
+- Rotate or revoke the key by replacing it in the service and application configuration. Because only one key is accepted, rotation requires coordination and may interrupt requests. Protect configuration and rate-limit failed authentication attempts where practical.
 
 ## Audit logging
 
-Persist audit records for API key lifecycle actions, including creation, rotation and revocation, and for domain entity lifecycle events. Write each entry as a simple text statement that the event occurred, without change details or key secrets. Account events from both the API and provider webhooks must be covered, along with organisation ownership transfers, suspension changes, deletion flag changes, and sweeps.
+Persist audit records in a PostgreSQL table for domain entity lifecycle actions. Record that an action occurred without change details or key secrets. Account changes from both the API and provider webhooks must be covered, along with organisation ownership transfers, pending deletion, cancellation, and sweeps. Key management happens in deployment configuration rather than through Precinct's API.
 
-Audit logs are written to files partitioned by date, with configurable retention defaulting to 90 days. Store them on persistent storage accessible to the service across container restarts. For database-backed changes, record an audit event in a transactional outbox in the same transaction as the state change; a background process writes pending events to the appropriate dated file and retries failures. Give events stable identifiers so retries can be recognised, and retain pending events until safely delivered. File delivery is asynchronous and may lag the change. Define the file format, date boundary, duplicate handling, rotation event representation, and access controls during implementation.
+Write each audit record in the same database transaction as its state change. Retention is configurable and defaults to 90 days. Define the minimal audit fields, cleanup procedure, and access controls during implementation.
 
 ## Deployment and operations
 
-Docker Compose defines the service and PostgreSQL deployment, including configuration and persistent database storage. The service receives database connection and provider settings, including the Clerk webhook signing secret, from its environment or deployment-managed secrets. Database readiness, schema migration execution, backups and restores, health checks, and upgrade procedures need to be designed before production use. Compose does not by itself specify production availability or recovery guarantees.
+Docker Compose defines the service and PostgreSQL deployment, including configuration and persistent database storage. The service receives the API key, database connection and provider settings, including the Clerk webhook signing secret, from its environment or deployment-managed secrets. Database readiness, schema migration execution, backups and restores, health checks, and upgrade procedures need to be designed before production use. Compose does not by itself specify production availability or recovery guarantees.
 
 ## Key decisions still required
 
-- HTTP API style, versioning, error format, and client integration contracts.
-- Clerk webhook operational handling and future provider integrations.
-- API key administrative interface.
-- PostgreSQL schema, migration ownership, and data lifecycle.
-- Operational targets for availability, observability, backup, and recovery.
+Outstanding architectural and product decisions are tracked in [Specification issues](issues.md).
